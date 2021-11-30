@@ -9,7 +9,7 @@ pub const Function = struct {
     // when taking the closure, each element must be
     // unique
     captures: []u8,
-    program: []Instr,
+    lambda_end: u32,
 };
 
 pub const BinaryBuiltin = enum {
@@ -46,7 +46,8 @@ pub const Closure = struct {
     // Keep the captures in a sparse array,
     // only the ones needed
     captures: std.AutoHashMap(u8, Value),
-    func: Function,
+    lambda_start: u32,
+    lambda_end: u32,
 
     fn deinit(self: *Closure) void {
         var it = self.captures.valueIterator();
@@ -59,7 +60,8 @@ pub const Closure = struct {
     fn clone(self: Closure) !Closure {
         return Closure {
             .captures = try self.captures.clone(),
-            .func = self.func,
+            .lambda_start = self.lambda_start,
+            .lambda_end = self.lambda_end,
         };
     }
 };
@@ -116,17 +118,17 @@ pub const Value = union(enum) {
 // Stack of function calls
 const CallStack = struct {
     const Frame = struct {
-        program: []Instr,
         prog_counter: u32,
+        prog_end: u32,
         args_to_pop: u32,
         captures: *const std.AutoHashMap(u8, Value),
     };
 
     frames: std.ArrayList(Frame),
 
-    fn init(alloc: *Allocator) CallStack {
-        return .{
-            .frames = std.ArrayList(Frame).init(alloc),
+    fn init(alloc: *Allocator) !CallStack {
+        return CallStack {
+            .frames = try std.ArrayList(Frame).initCapacity(alloc, 1024),
         };
     }
 
@@ -136,8 +138,8 @@ const CallStack = struct {
 
     fn push_frame(self: *CallStack, func: Closure, args_count: u32) !void {
         try self.frames.append(.{
-            .program = func.func.program,
-            .prog_counter = 0,
+            .prog_counter = func.lambda_start,
+            .prog_end = func.lambda_end,
             .args_to_pop = args_count,
             .captures = &func.captures,
         });
@@ -157,9 +159,9 @@ const Stack = struct {
     vals: std.ArrayList(Value),
     name: []const u8,
 
-    fn init(alloc: *Allocator, name: []const u8) Stack {
-        return .{
-            .vals = std.ArrayList(Value).init(alloc),
+    fn init(alloc: *Allocator, name: []const u8) !Stack {
+        return Stack {
+            .vals = try std.ArrayList(Value).initCapacity(alloc, 8),
             .name = name,
         };
     }
@@ -200,7 +202,7 @@ const Stack = struct {
     }
 };
 
-fn make_closure(alloc: *Allocator, env: Stack, func: Function) !Value {
+fn make_closure(alloc: *Allocator, env: Stack, lambda_start: u32, func: Function) !Value {
     var captures = std.AutoHashMap(u8, Value).init(alloc);
     // For each free variable we record
     // the corresponding value in the env
@@ -210,18 +212,19 @@ fn make_closure(alloc: *Allocator, env: Stack, func: Function) !Value {
     }
     return Value {
         .closure = .{
-            .func = func,
+            .lambda_start = lambda_start,
+            .lambda_end = func.lambda_end,
             .captures = captures,
         },
     };
 }
 
-pub fn eval(alloc: *Allocator, prog: []Instr) !Value {
-    var calls = CallStack.init(alloc);
+pub fn eval(alloc: *Allocator, program: []Instr) !Value {
+    var calls = try CallStack.init(alloc);
     // Stack for function arguments
-    var env = Stack.init(alloc, "Env");
+    var env = try Stack.init(alloc, "Env");
     // Operators stack
-    var values = Stack.init(alloc, "Operators");
+    var values = try Stack.init(alloc, "Operators");
     defer {
         values.deinit();
         env.deinit();
@@ -230,18 +233,16 @@ pub fn eval(alloc: *Allocator, prog: []Instr) !Value {
 
     var main: Closure = .{
         .captures = std.AutoHashMap(u8, Value).init(alloc),
-        .func = .{
-            .captures = &[_]u8{},
-            .program = prog,
-        },
+        .lambda_start = 0,
+        .lambda_end = @intCast(u32, program.len),
     };
 
     // Push main on the call stack, it has no arguments
     try calls.push_frame(main, 0);
     call_function: while(calls.frames.items.len > 0) {
         var curr_frame = calls.top_frame();
-        while(curr_frame.prog_counter < curr_frame.program.len) {
-            const curr_instr = curr_frame.program[curr_frame.prog_counter];
+        while(curr_frame.prog_counter < curr_frame.prog_end) {
+            const curr_instr = program[curr_frame.prog_counter];
             //std.debug.print("---------------------------\n", .{});
             //std.debug.print("Values on the stack: [\n", .{});
             //for(values.vals.items) |val| {
@@ -267,8 +268,11 @@ pub fn eval(alloc: *Allocator, prog: []Instr) !Value {
                     }
                 },
                 Instr.lambda => |fun| {
-                    const clos = try make_closure(alloc, env, fun);
+                    const clos = try make_closure(alloc, env, curr_frame.prog_counter + 1, fun);
                     try values.push(clos);
+                    // Jump to lambda end
+                    curr_frame.prog_counter = fun.lambda_end;
+                    continue;
                 },
                 Instr.number => |num| {
                     try values.push(.{

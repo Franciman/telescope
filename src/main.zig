@@ -48,13 +48,16 @@ pub fn main() anyerror!void {
     // }
     //
     // fix \sum. \n. if n < 1 then 0 else n + sum (n - 1)
-    var sum_internal = [_]Instr{
+    var caps = [_]u8 { 1 };
+    var sum = [_]Instr{
+        .{ .lambda = .{ .captures = &[_]u8{}, .lambda_end = 15 } },
+        .{ .lambda = .{ .captures = &caps, .lambda_end = 15 } },
         .{ .var_index = 0 },
         .{ .number = 1 },
         .{ .call_binary_builtin = .less_than },
-        .{ .jump_if_false = 6 },
+        .{ .jump_if_false = 8 },
         .{ .number = 0 },
-        .{ .jump = 13 },
+        .{ .jump = 15 },
         .{ .var_index = 1 },
         .{ .var_index = 0 },
         .{ .number = 1 },
@@ -62,27 +65,12 @@ pub fn main() anyerror!void {
         .ap,
         .{ .var_index = 0 },
         .{ .call_binary_builtin = .sum },
-    };
-    var sum_captures = [_]u8 { 1 };
-    var sum_internal_def = Machine.Function {
-        .captures = &sum_captures,
-        .program = &sum_internal,
-    };
-    var sum_def = [_]Instr {
-        .{ .lambda = sum_internal_def },
-    };
-    var sum = Machine.Function {
-        .captures = &[_]u8 {},
-        .program = &sum_def,
-    };
-    var somma = [_]Instr {
-        .{ .lambda = sum },
         .fix_ap_bottom,
         .fix,
-        .{ .number = 10000000 },
+        .{ .number = 100 },
         .ap,
     };
 
-    const res = try Machine.eval(allocator, &somma);
+    const res = try Machine.eval(allocator, &sum);
     res.print_value();
 }
