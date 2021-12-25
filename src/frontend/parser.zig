@@ -1,241 +1,272 @@
+const Lexer = @import("./lexer.zig");
+const Token = @import("./token.zig");
+const Syntax = @import("./syntax_tree.zig");
+const SourceFile = @import("./source_file.zig");
+const Diagnostics = @import("./diagnostics.zig");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
-const Lexer = @import("./lexer.zig");
-const Token = Lexer.Token;
-const TokenType = Lexer.TokenType;
-const Diagnostics = @import("./diag.zig");
-const AST = @import("./syntax_tree.zig");
-const SyntaxTree = AST.SyntaxTree;
 
-pub const ParserError = error {
-    UnexpectedToken,
-    MismatchedParens,
-    InvalidLexeme,
-    InvalidUtf8,
-    EmptyInput,
-    OutOfMemory,
+const FormatError = error {
+    parse_error,
 };
 
-// We define an extensible way to define
-// special forms, they are recognized by
-// the keyword at the first element of the list
-const SyntaxFormParser = fn (self: *Self) ParserError!*SyntaxTree;
+const Parser = struct {
+    /// Underlying lexer
+    lexer: Lexer,
+    /// Current lookahead symbol
+    look_ahead: Token,
+    /// Syntax Tree node allocator
+    alloc: Allocator,
 
-// Internal lexer
-lexer: Lexer,
-// Diagnostics collector
-diag: *Diagnostics,
-// Current token
-curr_token: Token,
-// Allocator used to build the tree
-alloc: *Allocator,
-
-
-// Registered syntactic forms
-syntax_forms: std.hash_map.StringHashMap(SyntaxFormParser),
-// This is the parser executed when no syntax form matches
-catch_all_form: SyntaxFormParser,
-
-const Self = @This();
-
-fn next_token(self: *Self) !void {
-    try self.lexer.next_token(&self.curr_token);
-}
-
-// Check if token is of expected type
-fn expect(self: *Self, ty: TokenType) !void {
-    if(self.curr_token != ty) {
-        try self.diag.expected_token_error(self.loc(), ty, self.curr_token);
-        return error.UnexpectedToken;
-    } else {
-        try self.next_token();
+    /// Consume current token
+    fn nextToken(parser: *Parser) !void {
+        try parser.lexer.nextToken(&parser.look_ahead);
     }
-}
 
-// Get current location
-fn loc(self: *Self) Lexer.SourceInfo {
-    return self.lexer.info;
-}
-
-fn parse_list(self: *Self) ParserError!*SyntaxTree {
-    switch(self.curr_token) {
-        Token.end_of_file => {
-            try self.diag.unexpected_end_of_file(self.loc());
-            return error.MismatchedParens;
-        },
-        Token.identifier => |ident| {
-            if(self.syntax_forms.get(ident)) |parser| {
-                try self.next_token();
-                const res = try parser(self);
-                try self.expect(.right_paren);
-                return res;
-            } else {
-                const res = try self.catch_all_form(self);
-                try self.expect(.right_paren);
-                return res;
-            }
-        },
-        else => {
-            const res = try self.catch_all_form(self);
-            try self.expect(.right_paren);
-            return res;
-        },
+    /// Add diagnostics
+    fn addDiagnostic(parser: *Parser, cat: Diagnostics.ErrorCategory) !void {
+        try parser.lexer.diags.errors.append(.{
+            .category = cat,
+            .loc = parser.lexer.getLoc(),
+            .expected_set = null,
+        });
     }
-}
 
-fn parse_value(self: *Self) ParserError!*SyntaxTree {
-    switch(self.curr_token) {
-        Token.left_paren => {
-            try self.next_token();
-            return parse_list(self);
-        },
-        Token.identifier => |data| {
-            try self.next_token();
-            var res = try self.alloc.create(SyntaxTree);
-            res.* = .{
-                .ident = data,
-            };
-            return res;
-        },
-        Token.integer => |data| {
-            try self.next_token();
-            var res = try self.alloc.create(SyntaxTree);
-            res.* = .{
-                .integer = data,
-            };
-            return res;
-        },
-        Token.float => |data| {
-            try self.next_token();
-            var res = try self.alloc.create(SyntaxTree);
-            res.* = .{
-                .float = data,
-            };
-            return res;
-        },
-        Token.end_of_file => {
-            try self.diag.unexpected_end_of_file(self.loc());
-            return error.EmptyInput;
-        },
-        else => {
-            try self.diag.unexpected_token(self.loc(), self.curr_token);
-            return error.UnexpectedToken;
+    /// Expect the look ahead to be of a given category
+    fn expect(self: *Parser, cat: Token.Category) !void {
+        if (self.look_ahead.category == cat) {
+            try self.nextToken();
+        } else {
+            try self.addDiagnostic(.unexpected_token);
+            return error.parse_error;
         }
     }
-}
 
-fn always_fail(self: *Self) ParserError!*SyntaxTree {
-    try self.diag.unexpected_token(self.loc(), self.curr_token);
-    return error.UnexpectedToken;
-}
-
-fn parse_function_application(self: *Self) ParserError!*SyntaxTree {
-    const func = try self.parse_value();
-    var list_builder = std.ArrayList(SyntaxTree).init(self.alloc);
-    while(self.curr_token != .end_of_file and self.curr_token != .right_paren) {
-        const val = try self.parse_value();
-        try list_builder.append(val.*);
-        self.alloc.destroy(val);
+    /// Get the text slice representing the given token
+    fn tokenSlice(self: Parser, tok: Token) []const u8 {
+        return self.lexer.input[tok.start_offset..tok.end_offset];
     }
-    var res = try self.alloc.create(SyntaxTree);
-    res.* = .{
-        .apply = .{
-            .function = func,
-            .arguments = list_builder.toOwnedSlice(),
-        },
-    };
-    return res;
-}
 
-fn parse_lambda_def(self: *Self) ParserError!*SyntaxTree {
-    try self.expect(.left_square);
-    var args_list = std.ArrayList([]const u8).init(self.alloc);
-    while(self.curr_token != .end_of_file and self.curr_token != .right_square and self.curr_token != .right_paren) {
-        switch(self.curr_token) {
-            Token.identifier => |id| {
-                try args_list.append(id);
+    fn parseLambda(self: *Parser) !*Syntax.Node {
+        try self.nextToken();
+        try self.expect(.left_paren);
+
+        var arguments = std.ArrayList([]const u8).init(self.alloc);
+        errdefer {
+            arguments.deinit();
+        }
+
+        while (self.look_ahead.category != .right_paren and self.look_ahead.category != .end_of_file) {
+            if (self.look_ahead.category == .identifier) {
+                try arguments.append(self.tokenSlice(self.look_ahead));
+            } else {
+                try self.addDiagnostic(.invalid_lambda_argument);
+                return error.parse_error;
+            }
+            try self.nextToken();
+        }
+        try self.expect(.right_paren);
+        const body = try self.parseSExpr();
+        errdefer {
+            body.deinitNode(self.alloc);
+        }
+
+        var result = try self.alloc.create(Syntax.Node);
+        result.* = .{
+            .lambda = .{
+                .body = body,
+                .args = arguments.toOwnedSlice(),
+            },
+        };
+        return result;
+    }
+
+    fn parseIf(self: *Parser) !*Syntax.Node {
+        try self.nextToken();
+        const cond = try self.parseSExpr();
+        errdefer {
+            cond.deinitNode(self.alloc);
+        }
+        const true_branch = try self.parseSExpr();
+        errdefer {
+            true_branch.deinitNode(self.alloc);
+        }
+
+        const false_branch = try self.parseSExpr();
+        errdefer {
+            false_branch.deinitNode(self.alloc);
+        }
+
+        var result = try self.alloc.create(Syntax.Node);
+
+        result.* = .{
+            .if_expr = .{
+                .cond = cond,
+                .true_branch = true_branch,
+                .false_branch = false_branch,
+            },
+        };
+
+        return result;
+    }
+
+    fn parseFix(self: *Parser) !*Syntax.Node {
+        try self.nextToken();
+        const body = try self.parseSExpr();
+        errdefer {
+            body.deinitNode(self.alloc);
+        }
+        var result = try self.alloc.create(Syntax.Node);
+        result.* = .{
+            .fix = body,
+        };
+        return result;
+    }
+
+    fn parseApply(self: *Parser) !*Syntax.Node {
+        const func = try self.parseSExpr();
+        errdefer {
+            func.deinitNode(self.alloc);
+        }
+        var args = std.ArrayList(*Syntax.Node).init(self.alloc);
+        errdefer {
+            for (args.items) |node| {
+                node.deinitNode(self.alloc);
+            }
+            args.deinit();
+        }
+        while (self.look_ahead.category != .right_paren and self.look_ahead.category != .end_of_file) {
+            const arg = try self.parseSExpr();
+            try args.append(arg);
+        }
+        var result = try self.alloc.create(Syntax.Node);
+        result.* = .{
+            .apply = .{
+                .func = func,
+                .args = args.toOwnedSlice(),
+            },
+        };
+        return result;
+    }
+
+    fn parseBuiltin(self: *Parser, builtin: Syntax.BuiltinOp) !*Syntax.Node {
+        try self.nextToken();
+        const left_arg = try self.parseSExpr();
+        errdefer {
+            left_arg.deinitNode(self.alloc);
+        }
+
+        const right_arg = try self.parseSExpr();
+        errdefer {
+            right_arg.deinitNode(self.alloc);
+        }
+
+        var result = try self.alloc.create(Syntax.Node);
+        result.* = .{
+            .builtin_apply = .{
+                .builtin_op = builtin,
+                .left_arg = left_arg,
+                .right_arg = right_arg,
+            },
+        };
+        return result;
+    }
+
+    fn parseList(self: *Parser) !*Syntax.Node {
+        // Consume left paren
+        try self.nextToken();
+        const res = try switch (self.look_ahead.category) {
+            .keyword_lambda => self.parseLambda(),
+            .keyword_if => self.parseIf(),
+            .keyword_fix => self.parseFix(),
+            .builtin_sum => self.parseBuiltin(.sum),
+            .builtin_sub => self.parseBuiltin(.sub),
+            .builtin_less_than => self.parseBuiltin(.less_than),
+            else => self.parseApply(),
+        };
+        errdefer {
+            res.deinitNode(self.alloc);
+        }
+        try self.expect(.right_paren);
+        return res;
+    }
+
+    fn parseSExpr(self: *Parser) anyerror!*Syntax.Node {
+        switch (self.look_ahead.category) {
+            .left_paren => {
+                return self.parseList();
+            },
+            .identifier => {
+                var res = try self.alloc.create(Syntax.Node);
+                res.* = .{
+                    .identifier = self.tokenSlice(self.look_ahead),
+                };
+                errdefer { res.deinitNode(self.alloc); }
+                try self.nextToken();
+                return res;
+            },
+            .integer => {
+                var res = try self.alloc.create(Syntax.Node);
+                res.* = .{
+                    .int_literal = self.tokenSlice(self.look_ahead),
+                };
+                errdefer { res.deinitNode(self.alloc); }
+                try self.nextToken();
+                return res;
+            },
+            .floating => {
+                var res = try self.alloc.create(Syntax.Node);
+                res.* = .{
+                    .float_literal = self.tokenSlice(self.look_ahead),
+                };
+                errdefer { res.deinitNode(self.alloc); }
+                try self.nextToken();
+                return res;
+            },
+            .bool_true => {
+                var res = try self.alloc.create(Syntax.Node);
+                res.* = .{
+                    .bool_literal = true,
+                };
+                errdefer { res.deinitNode(self.alloc); }
+                try self.nextToken();
+                return res;
+            },
+            .bool_false => {
+                var res = try self.alloc.create(Syntax.Node);
+                res.* = .{
+                    .bool_literal = false,
+                };
+                errdefer { res.deinitNode(self.alloc); }
+                try self.nextToken();
+                return res;
+            },
+            .end_of_file => {
+                try self.lexer.diags.addError(.unexpected_end_of_file, self.lexer.getLoc());
+                return error.parse_error;
             },
             else => {
-                try self.diag.invalid_lambda_arg(self.loc(), self.curr_token);
-                return error.UnexpectedToken;
+                try self.lexer.diags.addError(.unexpected_token, self.lexer.getLoc());
+                return error.parse_error;
             },
         }
-        try self.next_token();
     }
-    try self.expect(.right_square);
+};
 
-    const body = try self.parse_value();
-
-    var res = try self.alloc.create(SyntaxTree);
-    res.* = .{
-        .lambda = .{
-            .arguments = args_list.toOwnedSlice(),
-            .body = body,
-        },
-    };
-    return res;
-}
-
-fn parse_fix_def(self: *Self) ParserError!*SyntaxTree {
-
-    switch(self.curr_token) {
-        Token.identifier => |id| {
-            try self.next_token();
-            const body = try self.parse_value();
-            var res = try self.alloc.create(SyntaxTree);
-            res.* = .{
-                .fix = .{
-                    .rec_arg = id,
-                    .body = body,
-                },
-            };
-            return res;
-        },
-        else => {
-            try self.diag.invalid_fix_name(self.loc(), self.curr_token);
-            return error.UnexpectedToken;
-        },
-    }
-}
-
-fn parse_if(self: *Self) ParserError!*SyntaxTree {
-    const cond = try self.parse_value();
-    const true_branch = try self.parse_value();
-    const false_branch = try self.parse_value();
-    var res = try self.alloc.create(SyntaxTree);
-    res.* = .{
-        .if_stmt = .{
-            .cond = cond,
-            .true_branch = true_branch,
-            .false_branch = false_branch,
-        },
-    };
-
-    return res;
-}
-
-fn register_syntactic_forms(self: *Self) !void {
-    self.catch_all_form = parse_function_application;
-
-    try self.syntax_forms.putNoClobber("lambda", parse_lambda_def);
-    try self.syntax_forms.putNoClobber("fix", parse_fix_def);
-    try self.syntax_forms.putNoClobber("if", parse_if);
-}
-
-pub fn parse(alloc: *Allocator, diag: *Diagnostics, input: [:0]const u8) !AST {
-    var self: Self = .{
-        .lexer = Lexer.init(diag, input),
-        .diag = diag,
-        .curr_token = Token.end_of_file,
+pub fn parse(alloc: Allocator, src: *SourceFile) !Syntax.Tree {
+    var lexer = Lexer.init(src);
+    var look_ahead: Token = undefined;
+    // Load look ahead
+    try lexer.nextToken(&look_ahead);
+    var parser: Parser = .{
+        .lexer = lexer,
+        .look_ahead = look_ahead,
         .alloc = alloc,
-        .syntax_forms = std.hash_map.StringHashMap(SyntaxFormParser).init(alloc),
-        .catch_all_form = always_fail,
     };
 
-    try self.register_syntactic_forms();
-    try self.next_token();
-    const res = try self.parse_value();
-    return AST.init(alloc, res);
+    var root: *Syntax.Node = try parser.parseSExpr();
+    return Syntax.Tree {
+        .root = root,
+        .alloc = alloc,
+    };
 }
-

@@ -1,5 +1,4 @@
-(fix fib
-     (lambda ([: n Int])
-         (if (< n 2)
+((fix (lambda (sum n)
+         (if (#builtin_< n 1)
              n
-             (+ (fib (- n 1)) (fib (- n 2))))))
+             (#builtin_+ (sum (builtin_- n 1)) n)))) 10000000)

@@ -1,81 +1,93 @@
-const Allocator = @import("std").mem.Allocator;
+// Abstract syntax tree for telescope
+const std = @import("std");
+const Allocator = std.mem.Allocator;
 
-pub const SyntaxTree = union(enum) {
-    integer: []const u8,
-    float: []const u8,
-    ident: []const u8,
-    lambda: struct {
-        arguments: [][]const u8,
-        body: *SyntaxTree,
-    },
-    builtin: struct {
-        name: []const u8,
-        arguments: []SyntaxTree,
-    },
-    apply: struct {
-        function: *SyntaxTree,
-        arguments: []SyntaxTree,
-    },
-    fix: struct {
-        rec_arg: []const u8,
-        body: *SyntaxTree,
-    },
-    if_stmt: struct {
-        cond: *SyntaxTree,
-        true_branch: *SyntaxTree,
-        false_branch: *SyntaxTree,
+/// Function definition
+pub const FunctionDef = struct {
+    /// Body of the function
+    body: *Node,
+    /// Argument names
+    args: [][]const u8,
+};
+
+pub const BuiltinOp = enum {
+    sum,
+    sub,
+    less_than,
+};
+
+/// Binary builtin primitive application
+pub const BuiltinApply = struct {
+    builtin_op: BuiltinOp,
+    left_arg: *Node,
+    right_arg: *Node,
+};
+
+/// Function application
+pub const Apply = struct {
+    func: *Node,
+    args: []*Node,
+};
+
+pub const IfExpr = struct {
+    cond: *Node,
+    true_branch: *Node,
+    false_branch: *Node,
+};
+
+/// Node in the abstract syntax tree
+pub const Node = union(enum) {
+    int_literal: []const u8,
+    float_literal: []const u8,
+    bool_literal: bool,
+    identifier: []const u8,
+    lambda: FunctionDef,
+    builtin_apply: BuiltinApply,
+    apply: Apply,
+    fix: *Node,
+    if_expr: IfExpr,
+
+
+    /// This function is for internal use only, don't use it.
+    /// It deallocates the node using the allocator that allocated it
+    /// so this is dangerous
+    pub fn deinitNode(node: *Node, alloc: Allocator) void {
+        switch (node.*) {
+            .lambda => |lam| {
+                lam.body.deinitNode(alloc);
+            },
+            .builtin_apply => |ap| {
+                ap.left_arg.deinitNode(alloc);
+                ap.right_arg.deinitNode(alloc);
+            },
+            .apply => |ap| {
+                ap.func.deinitNode(alloc);
+                for (ap.args) |arg| {
+                    arg.deinitNode(alloc);
+                }
+            },
+            .fix => |body| {
+                body.deinitNode(alloc);
+            },
+            .if_expr => |if_expr| {
+                if_expr.cond.deinitNode(alloc);
+                if_expr.true_branch.deinitNode(alloc);
+                if_expr.false_branch.deinitNode(alloc);
+            },
+            else => {},
+        }
+        alloc.destroy(node);
     }
 };
 
-// Combine SyntaxTree with its allocator, nothing more
-expr: *SyntaxTree,
-alloc: *Allocator,
+pub const Tree = struct {
+    /// Allocator used to alloc nodes of the tree,
+    /// all the nodes are allocated by this allocator
+    alloc: Allocator,
+    /// Tree root
+    root: *Node,
 
-const Self = @This();
-
-pub fn init(alloc: *Allocator, expr: *SyntaxTree) Self {
-    return .{
-        .expr = expr,
-        .alloc = alloc,
-    };
-}
-
-fn deinit_sexpr(expr: SyntaxTree, alloc: *Allocator) void {
-    switch(expr.*) {
-        SyntaxTree.lambda => |lam| {
-            alloc.free(lam.arguments);
-            alloc.destroy(lam.body);
-        },
-        SyntaxTree.builtin => |bi| {
-            for(bi.arguments) |arg| {
-                deinit_sexpr(arg, alloc);
-            }
-            alloc.free(bi.arguments);
-        },
-        SyntaxTree.apply => |ap| {
-            alloc.destroy(ap.function);
-            for(ap.arguments) |arg| {
-                deinit_sexpr(arg, alloc);
-            }
-            alloc.free(ap.arguments);
-        },
-        SyntaxTree.Fix => |fix| {
-            alloc.destroy(fix.body);
-        },
-        SyntaxTreem.if_stmt => |stmt| {
-            deinit_sexpr(stmt.cond, alloc);
-            alloc.destroy(stmt.cond);
-            deinit_sexpr(stmt.true_branch, alloc);
-            alloc.destroy(stmt.true_branch);
-            deinit_sexpr(stmt.false_branch, alloc);
-            alloc.destroy(stmt.false_branch);
-
-        },
-        else => {},
+    pub fn deinit(self: @This()) void {
+        self.root.deinitNode(self.alloc);
     }
-}
-
-pub fn deinit(self: *Self) void {
-    deinit_sexpr(self.expr.*, self.alloc);
-    alloc.destroy(self.expr);
-}
+};

@@ -1,270 +1,236 @@
+const Lexer = @This();
+
+const Token = @import("./token.zig");
+const SourceFile = @import("./source_file.zig");
+const Diagnostics = @import("./diagnostics.zig");
 const std = @import("std");
-const Ziglyph = @import("Ziglyph");
-const Diagnostics = @import("./diag.zig");
+const unicode = std.unicode;
 
-pub const TokenType = enum {
-    left_paren,
-    right_paren,
-    left_square,
-    right_square,
-    identifier,
-    integer,
-    float,
-    end_of_file,
-};
-
-pub const Token = union(TokenType) {
-    left_paren,
-    right_paren,
-    left_square,
-    right_square,
-    identifier: []const u8,
-    integer: []const u8,
-    float: []const u8,
-    //comment: []const u8,
-    end_of_file,
-};
-
-// Location info
-pub const SourceInfo = struct {
-    // Byte position
-    byte_pos: u32,
-    // The logical line, i.e. number of \n found
-    line: u32,
-    // The codepoint offset in a given logical line
-    column: u32,
-};
-
-
-pub const LexError = error {
-    InvalidLexeme,
-    InvalidUtf8
-};
-
-// The lexer assumes that the whole input is in memory and is null terminated,
-// The lexer is in charge of recognizing atoms.
-
-
-info: SourceInfo,
-// Null-terminated slice, this helps the lexer finding EOF
+/// Null-terminated input UTF-8 encoded string
 input: [:0]const u8,
-// Diagnostics reporter
-diag: *Diagnostics,
+/// Curr position in the input
+offset: u32,
+/// Keep track of the line count
+line: u32,
+/// Keep track of the column count
+column: u32,
 
-const Self = @This();
+/// Diagnostics to tell about errors to
+diags: *Diagnostics,
 
-pub fn init(diag: *Diagnostics, input: [:0]const u8) Self {
+pub fn init(src: *SourceFile) Lexer {
     return .{
-        .info = .{
-            .byte_pos = 0,
-            .line = 1,
-            .column = 1
-        },
-        .input = input,
-        .diag = diag,
+        .input = src.contents,
+        .offset = 0,
+        .line = 0,
+        .column = 0,
+        .diags = &src.diags,
     };
 }
 
-fn curr_byte(self: Self) u8 {
-    return self.input[self.info.byte_pos];
+const FormatError = error {
+    parse_error,
+};
+
+// Character categories
+fn isDigit(c: u8) bool {
+    return '0' <= c and c <= '9';
 }
 
-// Warning, use it only if not at end of input
-fn look_ahead(self: Self) u8 {
-    return self.input[self.info.byte_pos + 1];
+fn isIdentStart(c: u8) bool {
+    return switch (c) {
+        // Symbols
+        '!', '$', '%',
+        '&', '*', '+',
+        '-', '.', '/',
+        ':', '<', '=',
+        '>', '?', '@',
+        '^', '_', '~',
+        '#',
+        // ASCII Letters
+        'A'...'Z',
+        'a'...'z' => true,
+
+        else => false,
+
+    };
 }
 
-// Increment column, but also byte_count by the given count
-fn next_char(self: *Self, byte_count: u32) void {
-    self.info.byte_pos += byte_count;
-    self.info.column += 1;
+fn isIdentCont(c: u8) bool {
+    return isIdentStart(c) or isDigit(c);
 }
 
-// Increment position after a line break
-fn next_line(self: *Self) void {
-    self.info.byte_pos += 1;
-    self.info.line += 1;
+/// Make location
+pub fn getLoc(self: Lexer) Diagnostics.Location {
+    return .{
+        .line = self.line,
+        .col = self.column,
+    };
 }
 
-fn decode_codepoint(self: *Self, codepoint: *u21) !u32 {
-    // If there is a decoding error, add diagnostics
-    const codepoint_len = std.unicode.utf8ByteSequenceLength(self.curr_byte()) catch return error.InvalidUtf8;
-    switch(codepoint_len) {
-        1 => codepoint.* = self.curr_byte(),
-        2 => {
-            const sub_slice = self.input[self.info.byte_pos..self.info.byte_pos + 2];
-            codepoint.* = std.unicode.utf8Decode2(sub_slice) catch {
-                try self.diag.invalid_utf8_seq(self.info);
-                return error.InvalidUtf8;
-            };
-        },
-        3 => {
-            const sub_slice = self.input[self.info.byte_pos..self.info.byte_pos + 3];
-            codepoint.* = std.unicode.utf8Decode3(sub_slice) catch {
-                try self.diag.invalid_utf8_seq(self.info);
-                return error.InvalidUtf8;
-            };
-        },
-        4 => {
-            const sub_slice = self.input[self.info.byte_pos..self.info.byte_pos + 4];
-            codepoint.* = std.unicode.utf8Decode4(sub_slice) catch {
-                try self.diag.invalid_utf8_seq(self.info);
-                return error.InvalidUtf8;
-            };
-        },
-        else => unreachable,
-    }
-    return codepoint_len;
+/// Consume next codepoint on the current line, and update position
+/// Also check that it is a valid utf8 sequence
+fn nextColumn(self: *Lexer) !void {
+    const len = unicode.utf8ByteSequenceLength(self.input[self.offset]) catch {
+        try self.diags.addError(.invalid_utf8_byte, self.getLoc());
+        return error.parse_error;
+    };
+    self.offset += len;
+    self.column += 1;
 }
 
-fn is_alphanumeric(codepoint: u21) bool {
-    return Ziglyph.isLetter(codepoint) or Ziglyph.isNumber(codepoint);
+/// Go to next line, and update position
+fn nextLine(self: *Lexer) void {
+    self.offset += 1;
+    self.column = 0;
+    self.line += 1;
 }
 
-fn is_digit(byte: u8) bool {
-    return '0' <= byte and byte <= '9';
+/// Token creation functions
+/// Set where the token starts.
+fn startToken(self: *Lexer, tok: *Token) void {
+    tok.start_offset = self.offset;
 }
 
-fn lex_comment(self: *Self, token: *Token) !void {
-    // comments are ignored for now
-    const comment_start = self.info.byte_pos;
-    while(self.curr_byte() != '\n' and self.curr_byte() != 0) {
-        // We need to correctly keep track of character count
-        const codepoint_len = std.unicode.utf8ByteSequenceLength(self.curr_byte()) catch {
-            try self.diag.invalid_utf8_seq(self.info);
-            return error.InvalidUtf8;
-        };
-        self.next_char(codepoint_len);
-    }
-    const commend_end = self.info.byte_pos;
-    if(self.curr_byte() == '\n') {
-        self.next_line();
-    }
+/// Set where the token ends
+fn endToken(self: *Lexer, tok: *Token) void {
+    tok.end_offset = self.offset;
 }
 
-fn lex_int(self: *Self) void {
-    while(is_digit(self.curr_byte())) {
-        self.next_char(1);
+fn currChar(self: Lexer) u8 {
+    return self.input[self.offset];
+}
+
+fn lexComment(self: *Lexer) !void {
+    while (self.input[self.offset] != '\n' and self.input[self.offset] != 0) {
+        try self.nextColumn();
     }
 }
 
-fn lex_number(self: *Self, token: *Token) !void {
-    const num_start = self.info.byte_pos;
-    // Take care of the initial sign
-    if(self.curr_byte() == '+' or self.curr_byte() == '-') {
-        self.next_char(1);
-    }
-    // Note that we are always sure there is at least one digit here
-    lex_int(self);
-    if(self.curr_byte() == '.') {
-        self.next_char(1);
-        lex_int(self);
-        const num_stop = self.info.byte_pos;
-        token.* = Token {
-            .float = self.input[num_start..num_stop],
-        };
-    } else {
-        const num_stop = self.info.byte_pos;
-        token.* = Token {
-            .integer = self.input[num_start..num_stop],
-        };
+// Let us define an helper to parse decimal numbers
+fn lexDecimal(self: *Lexer) !void {
+    while(isDigit(self.currChar())) {
+        try self.nextColumn();
     }
 }
 
-fn lex_ident(self: *Self, token: *Token) !void {
-    const ident_start = self.info.byte_pos;
-    var curr_codepoint: u21 = 0;
-    // Let's first check for extended identifiers
-    while(true) {
-        switch(self.curr_byte()) {
-            0 => break,
 
-            '!', '$', '%', '&',
-            '*', '+', '-', '.',
-            '/', ':', '<', '=',
-            '>', '?', '@', '^',
-            '_', '~' => self.next_char(1),
+fn lexNumber(self: *Lexer, tok: *Token) !void {
+    self.startToken(tok);
+    // Category of the number, we start assuming it's an integer
+    // if we find a dot, it becomes a float.
+    var cat: Token.Category = .integer;
+    // Taoke care of initial sign
+    if (self.currChar() == '+' or self.currChar() == '-') {
+        try self.nextColumn();
+    }
+    // When we reach this point we are always sure there
+    // is at least one digit, so we parse a number
+    //
+    try self.lexDecimal();
 
-            else => {
-                const codepoint_len = try self.decode_codepoint(&curr_codepoint);
-                // We can directly check for id_continue, because we are directly
-                // sure that if this is the first iteration, this codepoint can't
-                // be a digit, because we alredy caught that case previously
-                if(!is_alphanumeric(curr_codepoint)) {
-                    break;
-                }
-                self.next_char(codepoint_len);
-            }
+    if (self.currChar() == '.') {
+        // It is a floating now
+        cat = .floating;
+        try self.nextColumn();
+        // There can also be no decimal number
+        try self.lexDecimal();
+    }
+    tok.category = cat;
+    self.endToken(tok);
+}
+
+const Keyword = struct {
+    identifier: []const u8,
+    category: Token.Category,
+};
+
+const keywords = [_]Keyword {
+    .{ .identifier = "true", .category = .bool_true },
+    .{ .identifier = "false", .category = .bool_false },
+    .{ .identifier = "lambda", .category = .keyword_lambda },
+    .{ .identifier = "fix", .category = .keyword_fix },
+    .{ .identifier = "if", .category = .keyword_if },
+    .{ .identifier = "#builtin_+", .category = .builtin_sum },
+    .{ .identifier = "#builtin_-", .category = .builtin_sub },
+    .{ .identifier = "#builtin_<", .category = .builtin_less_than },
+};
+
+/// Check for reserved keywords
+fn identifierCategory(ident: []const u8) Token.Category {
+    for (keywords) |kw| {
+        if (std.mem.eql(u8, kw.identifier, ident)) {
+            return kw.category;
         }
     }
-    const ident_end = self.info.byte_pos;
-    if(ident_start == ident_end) {
-        // it means we could not parse anything, this is an invalid lexeme
-        try self.diag.invalid_lexeme(self.info);
-        return error.InvalidLexeme;
-    } else {
-        const ident = self.input[ident_start..ident_end];
-        token.* = Token {
-            .identifier = ident,
-        };
-    }
+    return .identifier;
 }
 
-pub fn next_token(self: *Self, token: *Token) !void {
-    var done = false;
-    while(!done) {
-        // By default we assume we are done after this step
-        done = true;
-        // Let us first check if there is any special symbol
-        switch(self.curr_byte()) {
-            0   => token.* = Token.end_of_file,
+fn lexIdent(self: *Lexer, tok: *Token) !void {
+    self.startToken(tok);
+    if (!isIdentStart(self.currChar())) {
+        try self.diags.addError(.invalid_char, self.getLoc());
+        return error.parse_error;
+    }
+    try self.nextColumn();
+    while (isIdentCont(self.currChar())) {
+        try self.nextColumn();
+    }
+    self.endToken(tok);
+    const ident = self.input[tok.start_offset..tok.end_offset];
+    tok.category = identifierCategory(ident);
+}
+
+pub fn nextToken(self: *Lexer, tok: *Token) !void {
+    var consume_more = true;
+    while(consume_more) {
+        // By default we want to make a single round
+        consume_more = false;
+        const curr_char = self.input[self.offset];
+        switch(curr_char) {
+            0 => {
+                self.startToken(tok);
+                self.endToken(tok);
+                tok.category = .end_of_file;
+            },
             ' ', '\t' => {
-                self.next_char(1);
-                // Ignore whitespace, keep lexing
-                done = false;
+                // Ignore whitespaces
+                try self.nextColumn();
+                consume_more = true;
             },
             '\n' => {
-                self.next_line();
-                done = false;
+                // Ignore whitespaces
+                self.nextLine();
+                consume_more = true;
             },
             '(' => {
-                self.next_char(1);
-                token.* = Token.left_paren;
+                self.startToken(tok);
+                tok.category = .left_paren;
+                try self.nextColumn();
+                self.endToken(tok);
             },
             ')' => {
-                self.next_char(1);
-                token.* = Token.right_paren;
-            },
-            '[' => {
-                self.next_char(1);
-                token.* = Token.left_square;
-            },
-            ']' => {
-                self.next_char(1);
-                token.* = Token.right_square;
+                self.startToken(tok);
+                tok.category = .right_paren;
+                try self.nextColumn();
+                self.endToken(tok);
             },
             ';' => {
-                self.next_char(1);
-                try lex_comment(self, token);
+                // Ignore comments (FOR NOW)
+                try self.lexComment();
+                consume_more = true;
             },
             '0'...'9' => {
-                try lex_number(self, token);
+                try self.lexNumber(tok);
             },
             '+', '-' => {
-                // For + and - we must first check
-                // if they start are the start of a number
-                if(is_digit(self.look_ahead())) {
-                    try lex_number(self, token);
+                if (isDigit(self.input[self.offset + 1])) {
+                    try self.lexNumber(tok);
                 } else {
-                    try lex_ident(self, token);
+                    try self.lexIdent(tok);
                 }
             },
-            else => {
-                // So what's left to check is if we are lexing
-                // an identifier.
-                // Here we must take care of utf8 eccentricities
-                try lex_ident(self, token);
-            },
+            else => try self.lexIdent(tok),
         }
     }
 }

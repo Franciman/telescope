@@ -12,7 +12,6 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
 
     const exe = b.addExecutable("telescope", "src/main.zig");
-    exe.addPackagePath("Ziglyph", "libs/ziglyph/src/Ziglyph.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();
