@@ -42,7 +42,9 @@ const ProgramBuilder = struct {
     }
 
     pub fn toOwnedProgram(self: *Self) !Program.Program {
-        var opcodes = try self.opcodes.toOwnedSliceSentinel(Program.Instr.halt);
+        // Add the final halt instruction.
+        try self.opcodes.append(Program.Instr.halt);
+        var opcodes = self.opcodes.toOwnedSlice();
         var functions = self.functions.toOwnedSlice();
         var integers = self.integers.toOwnedSlice();
         var floats = self.floats.toOwnedSlice();

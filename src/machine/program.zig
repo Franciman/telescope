@@ -76,7 +76,9 @@ pub const FunctionDef = struct {
 /// and the constants to complement it.
 pub const Program = struct {
     /// The list of instructions always ends with an halt opcode.
-    opcodes: [:Instr.halt]Instr,
+    /// As of now, we can't impose such constraint in the sentinel
+    /// see <https://github.com/ziglang/zig/issues/10413>
+    opcodes: []Instr,
 
     /// Constants of the program
     functions: []FunctionDef,
